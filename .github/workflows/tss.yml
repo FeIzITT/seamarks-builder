@@ -40,11 +40,15 @@ jobs:
             curl -sSfLI --max-time 60 "$url" >/dev/null && break
             echo "Geofabrik не отвечает (попытка $i), ждём"; sleep $((60 * i))
           done
-          # Без -R: нужны точки линий и линии отношений, чтобы собрать геометрию
-          curl -sSfL "$url" \
-            | osmium tags-filter -F pbf - \
-                nwr/seamark:type=separation_zone,separation_roundabout,separation_lane,separation_line,separation_boundary,separation_crossing,inshore_traffic_zone,precautionary_area \
-                -o tss.osm.pbf
+          # Без -R (нужны точки линий и линии отношений) osmium читает файл дважды — из потока нельзя,
+          # поэтому качаем на временный диск раннера /mnt: на системном места под Европу (31 ГБ) нет
+          sudo mkdir -p /mnt/w && sudo chown "$USER" /mnt/w
+          df -h /mnt | tail -1
+          curl -sSfL --retry 3 --retry-all-errors --retry-delay 60 -o /mnt/w/src.osm.pbf "$url"
+          osmium tags-filter /mnt/w/src.osm.pbf \
+              nwr/seamark:type=separation_zone,separation_roundabout,separation_lane,separation_line,separation_boundary,separation_crossing,inshore_traffic_zone,precautionary_area \
+              -o tss.osm.pbf
+          rm -f /mnt/w/src.osm.pbf
           osmium export tss.osm.pbf -f geojsonseq --add-unique-id=type_id -o "out/tss_${name}.geojsonseq"
           wc -l "out/tss_${name}.geojsonseq"
           echo "ARTIFACT=tss-region-${name}" >> "$GITHUB_ENV"
