@@ -1,0 +1,78 @@
+# Выгрузка навигационных знаков мира (буи, знаки, огни) из OpenStreetMap и нарезка их в тайлы z8.
+# Готовые выгрузки континентов Geofabrik фильтруются osmium на лету, без сохранения на диск.
+# Результат — ветка seamarks-data: <z>/<x>/<y>.json и index.json. Данные © участники OpenStreetMap, ODbL.
+name: Build seamark tiles
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Регионы Geofabrik (JSON-массив путей без -latest.osm.pbf)"
+        default: '["africa","antarctica","asia","australia-oceania","central-america","europe","north-america","south-america","russia"]'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-seamarks
+  cancel-in-progress: true
+
+jobs:
+  region:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(inputs.regions) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: sudo apt-get update -q && sudo apt-get install -y -q osmium-tool
+      - name: Filter ${{ matrix.region }}
+        env:
+          REGION: ${{ matrix.region }}
+        run: |
+          set -o pipefail
+          mkdir -p sm-raw
+          name=$(echo "$REGION" | tr '/' '_')
+          curl -sSfL --retry 5 --retry-delay 30 "https://download.geofabrik.de/${REGION}-latest.osm.pbf" \
+            | osmium tags-filter -R -F pbf - n/seamark:type n/seamark:light:character n/seamark:light:1:colour -o sm.osm.pbf
+          osmium export sm.osm.pbf -f geojsonseq --add-unique-id=type_id -o sm.geojsonseq
+          node scripts/geojsonseq-to-sm.mjs sm.geojsonseq "sm-raw/sq_${name}.json"
+          echo "ARTIFACT=sm-region-${name}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: sm-raw
+
+  build:
+    needs: region
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sm-region-*
+          path: sm-raw
+          merge-multiple: true
+      - name: Build tiles
+        run: |
+          ls -la sm-raw
+          node scripts/build-seamarks.mjs sm-raw sm-tiles
+      - name: Push tiles to branch seamarks-data
+        run: |
+          cd sm-tiles
+          git init -q -b seamarks-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "Seamark tiles from OpenStreetMap (ODbL), regions: ${{ inputs.regions }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" seamarks-data
