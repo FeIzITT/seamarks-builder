@@ -1,0 +1,75 @@
+# Схемы разделения движения (TSS) мира из OpenStreetMap: зоны, полосы, линии и внешние границы схем,
+# прибрежные зоны, районы осторожного плавания. Геометрия мультиполигонов собирается osmium целиком.
+# Результат — ветка tss-data: tss_<регион>.geojsonseq. Данные © участники OpenStreetMap, ODbL.
+name: Fetch traffic separation schemes
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Регионы Geofabrik (JSON-массив путей без -latest.osm.pbf)"
+        default: '["africa","antarctica","asia","australia-oceania","central-america","europe","north-america","south-america","russia"]'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-tss
+  cancel-in-progress: true
+
+jobs:
+  region:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        region: ${{ fromJSON(inputs.regions) }}
+    steps:
+      - run: sudo apt-get update -q && sudo apt-get install -y -q osmium-tool
+      - name: Filter ${{ matrix.region }}
+        env:
+          REGION: ${{ matrix.region }}
+        run: |
+          set -o pipefail
+          mkdir -p out
+          name=$(echo "$REGION" | tr '/' '_')
+          url="https://download.geofabrik.de/${REGION}-latest.osm.pbf"
+          for i in $(seq 1 10); do
+            curl -sSfLI --max-time 60 "$url" >/dev/null && break
+            echo "Geofabrik не отвечает (попытка $i), ждём"; sleep $((60 * i))
+          done
+          # Без -R: нужны точки линий и линии отношений, чтобы собрать геометрию
+          curl -sSfL "$url" \
+            | osmium tags-filter -F pbf - \
+                nwr/seamark:type=separation_zone,separation_roundabout,separation_lane,separation_line,separation_boundary,separation_crossing,inshore_traffic_zone,precautionary_area \
+                -o tss.osm.pbf
+          osmium export tss.osm.pbf -f geojsonseq --add-unique-id=type_id -o "out/tss_${name}.geojsonseq"
+          wc -l "out/tss_${name}.geojsonseq"
+          echo "ARTIFACT=tss-region-${name}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: out
+
+  collect:
+    needs: region
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tss-region-*
+          path: tss
+          merge-multiple: true
+      - name: Push to branch tss-data
+        run: |
+          cd tss
+          wc -l *.geojsonseq
+          git init -q -b tss-data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "Traffic separation schemes from OpenStreetMap (ODbL), regions: ${{ inputs.regions }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" tss-data
